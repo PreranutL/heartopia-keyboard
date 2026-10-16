@@ -16,6 +16,7 @@
 #include <string>
 #include <optional>
 #include <cstdint>
+#include <array>
 
 // Dedicated exception for MIDI file errors
 class MidiFileException : public std::runtime_error { using runtime_error::runtime_error; };
@@ -26,6 +27,8 @@ class MidiDeviceException : public std::runtime_error { using runtime_error::run
 
 class KeyboardEmitter {
 private: // Defaults, I know. Explicit though :pleading:
+	std::array<INPUT, 256> keyDown{};
+	std::array<INPUT, 256> keyUp{};
 
 	// Turn from a vk (int) to a scancode (WORD).
 	// Allows mapping text characters to keyboard buttons, basically.
@@ -63,23 +66,28 @@ private: // Defaults, I know. Explicit though :pleading:
 	}
 
 public:
-	void SendKey(int vKey, bool pressed) const {
-		// First, create an INPUT (Windows struct :P) using our input 
-		INPUT input{};
-		input.type = INPUT_KEYBOARD;
-		input.ki.wVk = 0;
-		input.ki.wScan = GetScanCode(vKey); // Scancode instead of vk, since vk is for typing & scancode is for input.
-		input.ki.dwFlags = KEYEVENTF_SCANCODE;
+	KeyboardEmitter() {
+		// This work used to happen once per MIDI event. Prebuilding it keeps the
+		// callback focused on the unavoidable SendInput call.
+		for (int vKey = 0; vKey < 256; ++vKey) {
+			INPUT input{};
+			input.type = INPUT_KEYBOARD;
+			input.ki.wScan = GetScanCode(vKey);
+			input.ki.dwFlags = KEYEVENTF_SCANCODE;
+			if (IsExtended(vKey))
+				input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
 
-		// If it's an extended range key, enable extended. Crazy, I know.
-		if (IsExtended(vKey))
-			input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-
-		// If it's being unpressed, flip this flag.
-		if (!pressed)
+			keyDown[vKey] = input;
 			input.ki.dwFlags |= KEYEVENTF_KEYUP;
+			keyUp[vKey] = input;
+		}
+	}
 
-		// And finally, send the input. This emulated a keyboard press, basically.
+	void SendKey(int vKey, bool pressed) const {
+		if (vKey < 0 || vKey >= static_cast<int>(keyDown.size()))
+			return;
+
+		INPUT input = pressed ? keyDown[vKey] : keyUp[vKey];
 		SendInput(1, &input, sizeof(INPUT));
 	}
 };
@@ -125,25 +133,21 @@ private:
 	#endif
 	}
 
-	// The map in question.
-	std::unordered_map<int, int> map;
+	// MIDI notes are bytes. A fixed lookup table avoids a hash lookup on every
+	// note event; -1 represents an unmapped note.
+	std::array<int, 128> map{};
 
 public:
 	// Constructor :yippee:
 	explicit MidiMapper(bool whitesOnly) {
-		if (whitesOnly)
-			map = whitesMap();
-		else
-			map = fullMap();
+		map.fill(-1);
+		const auto source = whitesOnly ? whitesMap() : fullMap();
+		for (const auto& [note, key] : source)
+			map[note] = key;
 	}
 
-	std::optional<int> MapNote(int note) const {
-		// Find an iterator to the note in the map, if it exists. Then return the corresponding key.
-		// Also, inverted for the in-if init statement. Thanks for reminding me, linter.
-		if (auto it = map.find(note); it != map.end())
-			return it->second;
-
-		return std::nullopt;
+	int MapNote(int note) const noexcept {
+		return note >= 0 && note < static_cast<int>(map.size()) ? map[note] : -1;
 	}
 };
 
@@ -372,7 +376,7 @@ private:
 	HMIDIIN handle{}; // Every Windows handle makes me want to cry.
 	MidiMapper& mapper;
 	KeyboardEmitter& emitter;
-	std::unordered_set<int> pressed;
+	std::array<bool, 256> pressed{};
 	std::mutex mutex;
 
 	static void CALLBACK Callback(HMIDIIN, UINT msg, DWORD_PTR instance, DWORD_PTR param1, DWORD_PTR) {
@@ -388,30 +392,28 @@ private:
 		uint8_t vel = (param1 >> 16) & 0xFF;
 
 		// Get the mapped key.
-		auto mapped = self->mapper.MapNote(note);
-
-		// It's optional.
-		if (!mapped.has_value())
+		const int mapped = self->mapper.MapNote(note);
+		if (mapped < 0)
 			return;
 
 		// Mutex, to avoid multithreading issues or smth. Jthread my beloved.
 		std::scoped_lock lock(self->mutex);
 
 		if ((status & 0xF0) == 0x90 && vel > 0) { // Note on
-			if (self->pressed.contains(*mapped)) // If it's already pressed, return.
+			if (self->pressed[mapped]) // If it's already pressed, return.
 				return;
 
 			// Add it to the list of pressed keys, and press it.
-			self->pressed.insert(*mapped);
-			self->emitter.SendKey(*mapped, true);
+			self->pressed[mapped] = true;
+			self->emitter.SendKey(mapped, true);
 
 		} else if (((status & 0xF0) == 0x80) || ((status & 0xF0) == 0x90 && vel == 0)) { // Note off.
-			if (!self->pressed.contains(*mapped)) // If it's not pressed, return.
+			if (!self->pressed[mapped]) // If it's not pressed, return.
 				return;
 
 			// Remove it from the list of pressed keys, and unpress it.
-			self->pressed.erase(*mapped);
-			self->emitter.SendKey(*mapped, false);
+			self->pressed[mapped] = false;
+			self->emitter.SendKey(mapped, false);
 		}
 	}
 
@@ -443,6 +445,13 @@ public:
 // Can we put sunglasses on functions? I wish we could.
 int main(int argc, char** argv) {
 	try { // Good error handling is for dorks. Everything in a try catch(e).
+		#ifdef ROLANDGO3KEYBOARD
+		// Reduce scheduling jitter under CPU load. High priority is deliberate;
+		// real-time priority can starve Windows input, audio, and drivers.
+		if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS))
+			std::cerr << "Warning: could not enable high process priority.\n";
+		#endif
+
 		// Heartopia's two-row layout uses A-S-D-F-G-H-J for the lower row
 		// and Q-W-E-R-T-Y-U-I for the upper row.
 		// The three-row version uses all keys, including the black keys shown
@@ -489,8 +498,8 @@ int main(int argc, char** argv) {
 				std::this_thread::sleep_until(start + std::chrono::milliseconds(e.timeMs));
 
 				// Get the corresponding input to the event. If it exists, play it.
-				if (auto mapped = mapper.MapNote(e.note); mapped.has_value())
-					emitter.SendKey(*mapped, e.noteOn);
+				if (const int mapped = mapper.MapNote(e.note); mapped >= 0)
+					emitter.SendKey(mapped, e.noteOn);
 			}
 		}
 	} catch (const std::exception& e) { // ZOINKS!
