@@ -106,11 +106,23 @@ private:
 
 	// ^ Ditto
 	static std::unordered_map<int, int> whitesMap() {
+	#ifdef ROLANDGO3KEYBOARD
+		// Heartopia's three-row white-key layout (low to high):
+		// , . / O P [ ] | Z X C V B N M | Q W E R T Y U I
+		return {
+			{48,VK_OEM_COMMA}, {50,VK_OEM_PERIOD}, {52,VK_OEM_2}, {53,'O'},
+			{55,'P'}, {57,VK_OEM_4}, {59,VK_OEM_6},
+			{60,'Z'}, {62,'X'}, {64,'C'}, {65,'V'}, {67,'B'},
+			{69,'N'}, {71,'M'}, {72,'Q'}, {74,'W'}, {76,'E'},
+			{77,'R'}, {79,'T'}, {81,'Y'}, {83,'U'}, {84,'I'}
+		};
+	#else
 		return {
 			{60,'A'},{62,'S'},{64,'D'},{65,'F'},{67,'G'},
 			{69,'H'},{71,'J'},{72,'Q'},{74,'W'},{76,'E'},
 			{77,'R'},{79,'T'},{81,'Y'},{83,'U'},{84,'I'}
 		};
+	#endif
 	}
 
 	// The map in question.
@@ -433,7 +445,13 @@ int main(int argc, char** argv) {
 	try { // Good error handling is for dorks. Everything in a try catch(e).
 		// Heartopia's two-row layout uses A-S-D-F-G-H-J for the lower row
 		// and Q-W-E-R-T-Y-U-I for the upper row.
+		// The three-row version uses all keys, including the black keys shown
+		// between each pair of white keys. The original player stays white-only.
+		#ifdef ROLANDGO3KEYBOARD
+		bool whitesOnly = false;
+		#else
 		bool whitesOnly = true;
+		#endif
 		std::string file;
 
 		// If there are arguments
